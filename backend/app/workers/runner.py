@@ -4,11 +4,14 @@ from pymongo import ReturnDocument
 from app.db.mongo import db, init_indexes
 from app.ingestion.file_router import detect_type
 from app.ingestion import pdf, image, spreadsheet
+from app.extraction.llm_extractor import extract_invoice
 
 LOW_CONF = 0.6
 
+
 def now():
     return datetime.now(timezone.utc)
+
 
 def claim_next():
     return db.documents.find_one_and_update(
@@ -17,15 +20,18 @@ def claim_next():
          "$inc": {"attempts": 1}},
         sort=[("created_at", 1)], return_document=ReturnDocument.AFTER)
 
+
 def recover_stale(minutes=10):
     db.documents.update_many(
         {"status": "processing", "heartbeat_at": {"$lt": now() - timedelta(minutes=minutes)}},
         {"$set": {"status": "queued"}})
 
+
 def event(doc_id, stage, status, t0, error=None):
     db.processing_events.insert_one({
         "document_id": doc_id, "stage": stage, "status": status, "started_at": now(),
         "duration_ms": int((time.time() - t0) * 1000), "error": error})
+
 
 def save_page(doc_id, p):
     db.pages.replace_one(
@@ -33,6 +39,7 @@ def save_page(doc_id, p):
         {"document_id": doc_id, "page_no": p.page_no, "text": p.text, "source": p.source,
          "ocr_confidence": p.ocr_confidence, "error": p.error, "meta": p.meta},
         upsert=True)
+
 
 def process(doc) -> str:
     doc_id, path = doc["_id"], doc["storage_path"]
@@ -77,8 +84,24 @@ def process(doc) -> str:
 
     bad = [p for p in pages if p.source == "error"
            or (p.ocr_confidence is not None and p.ocr_confidence < LOW_CONF)]
-    db.documents.update_one({"_id": doc_id}, {"$set": {"progress": 1.0, "low_quality_pages": [p.page_no for p in bad]}})
+    db.documents.update_one({"_id": doc_id}, {"$set": {"low_quality_pages": [p.page_no for p in bad]}})
+
+    # ---- AI extraction ----
+    t1 = time.time()
+    full_text = "\n\n".join(p.text for p in pages if p.text)
+    if not full_text.strip():
+        raise ValueError("No text found in document")
+    db.extractions.delete_many({"document_id": doc_id})   # avoids duplicates on reprocess
+    result = extract_invoice(full_text)
+    db.extractions.insert_one({
+        "document_id": doc_id, "version": 1, "data": result["data"],
+        "raw_llm_output": result["raw"], "field_confidence": result["field_confidence"],
+        "model": result["model"], "prompt_version": result["prompt_version"],
+        "usage": result["usage"], "created_at": now()})
+    event(doc_id, "extraction", "ok", t1)
+    db.documents.update_one({"_id": doc_id}, {"$set": {"progress": 1.0}})
     return "needs_review" if bad else "completed"
+
 
 def main():
     init_indexes()
@@ -101,6 +124,7 @@ def main():
                 {"$set": {"status": "failed", "error_message": str(e), "finished_at": now()}})
             print(f"  -> failed: {e}")
             traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()

@@ -98,3 +98,10 @@ def reprocess(doc_id: str):
     if not r.matched_count:
         raise HTTPException(409, "Document not found or currently processing")
     return {"id": doc_id, "status": "queued"}
+
+@router.get("/{doc_id}/result")
+def get_result(doc_id: str):
+    ex = db.extractions.find_one({"document_id": oid(doc_id)}, sort=[("version", -1)])
+    if not ex:
+        raise HTTPException(404, "No extraction yet")
+    return ser(ex)

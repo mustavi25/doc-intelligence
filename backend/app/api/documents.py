@@ -6,6 +6,10 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from app.config import settings
 from app.db.mongo import db
+from typing import Any
+from pydantic import BaseModel
+from app.validation.rules import validate
+from app.validation.duplicates import find_duplicates
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 UPLOAD_DIR = Path(settings.upload_dir).resolve()
@@ -101,7 +105,73 @@ def reprocess(doc_id: str):
 
 @router.get("/{doc_id}/result")
 def get_result(doc_id: str):
-    ex = db.extractions.find_one({"document_id": oid(doc_id)}, sort=[("version", -1)])
+    did = oid(doc_id)
+    ex = db.extractions.find_one({"document_id": did}, sort=[("version", -1)])
     if not ex:
         raise HTTPException(404, "No extraction yet")
-    return ser(ex)
+    issues = [ser(i) for i in db.validation_issues.find({"document_id": did})]
+    ex = ser(ex)
+    ex.pop("raw_llm_output", None)
+    return {**ex, "validation_issues": issues,
+            "needs_review": any(i["severity"] == "error" for i in issues)}
+EDITABLE = {"invoice_number", "invoice_date", "supplier_name", "customer_name",
+            "subtotal", "tax", "total", "currency", "line_items"}
+NUMERIC = {"subtotal", "tax", "total"}
+
+
+class CorrectionIn(BaseModel):
+    changes: dict[str, Any]
+    corrected_by: str = "user"
+
+
+@router.patch("/{doc_id}/result")
+def correct_result(doc_id: str, body: CorrectionIn):
+    did = oid(doc_id)
+    doc = db.documents.find_one({"_id": did})
+    ex = db.extractions.find_one({"document_id": did}, sort=[("version", -1)])
+    if not doc or not ex:
+        raise HTTPException(404, "No extraction to correct")
+
+    data, conf, logs = dict(ex["data"]), dict(ex.get("field_confidence") or {}), []
+    for field, new in body.changes.items():
+        if field not in EDITABLE:
+            raise HTTPException(422, f"Field '{field}' cannot be edited")
+        if field in NUMERIC and new not in (None, ""):
+            try:
+                new = float(new)
+            except (TypeError, ValueError):
+                raise HTTPException(422, f"'{field}' must be a number")
+        if new == "":
+            new = None
+        old = data.get(field)
+        if old != new:
+            logs.append({"document_id": did, "field": field, "old_value": old, "new_value": new,
+                         "corrected_by": body.corrected_by, "at": now()})
+            data[field] = new
+            conf[field] = 1.0          # a human confirmed this value
+    if not logs:
+        return {"changed": 0, "status": doc["status"]}
+
+    db.corrections.insert_many(logs)
+    db.extractions.update_one({"_id": ex["_id"]},
+        {"$set": {"data": data, "field_confidence": conf, "corrected": True, "updated_at": now()},
+         "$inc": {"version": 1}})
+
+    # re-run validation on the corrected data
+    issues = validate(data, None, None) + find_duplicates(did, data, doc.get("duplicate_of"))
+    for pg in doc.get("low_quality_pages") or []:
+        issues.append({"rule": "low_quality_page", "severity": "warning", "field": f"page {pg}",
+                       "message": f"Page {pg} had low OCR confidence or failed", "resolved": False})
+    db.validation_issues.delete_many({"document_id": did})
+    if issues:
+        db.validation_issues.insert_many([{**i, "document_id": did, "created_at": now()} for i in issues])
+
+    status = "needs_review" if any(i["severity"] == "error" for i in issues) else "completed"
+    db.documents.update_one({"_id": did}, {"$set": {"status": status}})
+    return {"changed": len(logs), "status": status, "validation_issues": [_jsonable(i) for i in issues]}
+
+
+@router.get("/{doc_id}/corrections")
+def list_corrections(doc_id: str):
+    rows = db.corrections.find({"document_id": oid(doc_id)}).sort("at", -1)
+    return {"items": [ser(r) for r in rows]}

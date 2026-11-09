@@ -3,6 +3,8 @@ from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 from app.db.mongo import client, db, init_indexes
 from app.api.documents import router as documents_router
+from app.api.search import router as search_router
+from app.api.metrics import router as metrics_router
 
 
 @asynccontextmanager
@@ -12,7 +14,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Document Intelligence API", lifespan=lifespan)
+
 app.include_router(documents_router)
+app.include_router(search_router)
+app.include_router(metrics_router)
 
 
 def custom_openapi():
@@ -37,6 +42,11 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
+
+
+@app.get("/")
+def root():
+    return {"service": "Document Intelligence API", "docs": "/docs", "health": "/api/health"}
 
 
 @app.get("/api/health")

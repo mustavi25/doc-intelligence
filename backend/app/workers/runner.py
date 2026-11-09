@@ -5,7 +5,9 @@ from app.db.mongo import db, init_indexes
 from app.ingestion.file_router import detect_type
 from app.ingestion import pdf, image, spreadsheet
 from app.extraction.llm_extractor import extract_invoice
-
+from app.validation.rules import validate
+from app.validation.duplicates import find_duplicates
+from app.search import semantic
 LOW_CONF = 0.6
 
 
@@ -81,6 +83,13 @@ def process(doc) -> str:
     event(doc_id, "text_extraction", "ok", t0)
     if not pages or all(p.source == "error" for p in pages):
         raise ValueError("No pages could be processed")
+        # ---- embeddings (failure here must not fail the document) ----
+    t3 = time.time()
+    try:
+        n = semantic.index_document(doc_id, pages)
+        event(doc_id, "embedding", "ok", t3)
+    except Exception as e:
+        event(doc_id, "embedding", "failed", t3, str(e))
 
     bad = [p for p in pages if p.source == "error"
            or (p.ocr_confidence is not None and p.ocr_confidence < LOW_CONF)]
@@ -99,32 +108,19 @@ def process(doc) -> str:
         "model": result["model"], "prompt_version": result["prompt_version"],
         "usage": result["usage"], "created_at": now()})
     event(doc_id, "extraction", "ok", t1)
+
+    # ---- validation ----
+    t2 = time.time()
+    issues = validate(result["data"], result["field_confidence"], result["raw"].get("uncertain_fields"))
+    issues += find_duplicates(doc_id, result["data"], doc.get("duplicate_of"))
+    for p in bad:
+        issues.append({"rule": "low_quality_page", "severity": "warning", "field": f"page {p.page_no}",
+                       "message": f"Page {p.page_no} had low OCR confidence or failed", "resolved": False})
+    db.validation_issues.delete_many({"document_id": doc_id})
+    if issues:
+        db.validation_issues.insert_many([{**i, "document_id": doc_id, "created_at": now()} for i in issues])
+    event(doc_id, "validation", "ok", t2)
+
     db.documents.update_one({"_id": doc_id}, {"$set": {"progress": 1.0}})
-    return "needs_review" if bad else "completed"
-
-
-def main():
-    init_indexes()
-    print("Worker started. Waiting for jobs...")
-    while True:
-        recover_stale()
-        doc = claim_next()
-        if not doc:
-            time.sleep(1.5)
-            continue
-        print(f"Processing {doc['filename']} ({doc['_id']})")
-        t0 = time.time()
-        try:
-            status = process(doc)
-            db.documents.update_one({"_id": doc["_id"]}, {"$set": {"status": status, "finished_at": now()}})
-            print(f"  -> {status} in {time.time() - t0:.1f}s")
-        except Exception as e:
-            event(doc["_id"], "processing", "failed", t0, str(e))
-            db.documents.update_one({"_id": doc["_id"]},
-                {"$set": {"status": "failed", "error_message": str(e), "finished_at": now()}})
-            print(f"  -> failed: {e}")
-            traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
+    has_error = any(i["severity"] == "error" for i in issues)
+    return "needs_review" if (has_error or bad) else "completed"
